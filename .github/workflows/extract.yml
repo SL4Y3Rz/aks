@@ -1,0 +1,167 @@
+name: Extract Dylib Data
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '*.dylib'
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Extract dylib data
+        run: |
+          python3 << 'EOF'
+import struct
+import json
+import re
+from pathlib import Path
+from dataclasses import dataclass, asdict
+
+@dataclass
+class DylibAnalysis:
+    file: str
+    arch: str
+    uuid: str
+    segments: list
+    sections: list
+    exports: list
+    imports: list
+    strings: list
+    objc_classes: list
+    dylib_deps: list
+    summary: dict
+
+dylib_file = Path("80pool1.dylib")
+if not dylib_file.exists():
+    dylib_file = list(Path(".").glob("*.dylib"))[0] if list(Path(".").glob("*.dylib")) else None
+
+if not dylib_file:
+    print("[!] No dylib found")
+    exit(1)
+
+data = bytearray(dylib_file.read_bytes())
+
+def u8(o): return data[o]
+def u32(o): return struct.unpack_from("<I", data, o)[0]
+def u64(o): return struct.unpack_from("<Q", data, o)[0]
+def cstring(o):
+    try:
+        end = data.index(b'\x00', o)
+        return data[o:end].decode("utf-8", errors="replace")
+    except:
+        return ""
+
+# Parse header
+magic = u32(0)
+is_64 = magic in (0xFEEDFACF, 0xCFFAEDFE)
+cputype = u32(4)
+ncmds = u32(16)
+lc_base = 32
+
+arch_map = {0x0100000C: "arm64", 0x01000007: "x86_64", 0x0000000C: "arm", 0x00000007: "x86"}
+arch = arch_map.get(cputype, "unknown")
+
+uuid_str = None
+segments, exports, imports, dylibs, strings, objc_classes = [], [], [], [], [], []
+
+text_vmaddr, text_fileoff = 0, 0
+lc_off = lc_base
+
+for _ in range(ncmds):
+    cmd, size = u32(lc_off), u32(lc_off + 4)
+    
+    if cmd == 0x19:  # LC_SEGMENT_64
+        segname = data[lc_off+8:lc_off+24].split(b'\x00')[0].decode("utf-8", errors="replace")
+        vmaddr, vmsize, fileoff, filesize = u64(lc_off+24), u64(lc_off+32), u64(lc_off+40), u64(lc_off+48)
+        nsects = u32(lc_off+64)
+        
+        if segname == "__TEXT":
+            text_vmaddr, text_fileoff = vmaddr, fileoff
+        
+        seg = {"name": segname, "vmaddr": hex(vmaddr), "vmsize": hex(vmsize), "sections": []}
+        sect_off = lc_off + 72
+        for _ in range(nsects):
+            sname = data[sect_off:sect_off+16].split(b'\x00')[0].decode("utf-8", errors="replace")
+            saddr, ssize, sfoff = u64(sect_off+32), u64(sect_off+40), u32(sect_off+48)
+            seg["sections"].append({"name": sname.strip(), "addr": hex(saddr), "size": hex(ssize), "offset": hex(sfoff)})
+            sect_off += 80
+        segments.append(seg)
+    
+    elif cmd == 0x1B:  # LC_UUID
+        raw = data[lc_off+8:lc_off+24]
+        uuid_str = "-".join([raw[0:4].hex(), raw[4:6].hex(), raw[6:8].hex(), raw[8:10].hex(), raw[10:16].hex()]).upper()
+    
+    elif cmd == 0x2:  # LC_SYMTAB
+        symoff, nsyms, stroff = u32(lc_off+8), u32(lc_off+12), u32(lc_off+16)
+        for i in range(nsyms):
+            noff = symoff + i * 16
+            n_strx, n_type = u32(noff), u8(noff+4)
+            n_value = u64(noff+8)
+            try:
+                name = cstring(stroff + n_strx)
+            except:
+                name = f"<sym_{i}>"
+            
+            is_undef = (n_type & 0x0E) == 0
+            if is_undef:
+                imports.append({"name": name})
+            else:
+                exports.append({"name": name, "value": hex(n_value)})
+    
+    elif cmd in (0xC, 0xD):  # LC_LOAD_DYLIB, LC_ID_DYLIB
+        name_off = u32(lc_off+8)
+        name = cstring(lc_off + name_off)
+        dylibs.append({"name": name})
+    
+    lc_off += size
+
+# Extract strings
+for seg in segments:
+    for sect in seg.get("sections", []):
+        if "__cstring" in sect["name"]:
+            off, size = int(sect["offset"], 16), int(sect["size"], 16)
+            raw = data[off:off+size]
+            for m in re.finditer(rb'[\x20-\x7E]{6,}', raw):
+                try:
+                    strings.append(m.group().decode("ascii", errors="replace"))
+                except:
+                    pass
+
+report = DylibAnalysis(
+    file=dylib_file.name,
+    arch=arch,
+    uuid=uuid_str or "N/A",
+    segments=segments,
+    sections=[s for seg in segments for s in seg.get("sections", [])],
+    exports=exports[:500],
+    imports=imports[:500],
+    strings=strings[:1000],
+    objc_classes=objc_classes,
+    dylib_deps=dylibs,
+    summary={"exports": len(exports), "imports": len(imports), "strings": len(strings), "dylibs": len(dylibs)}
+)
+
+json_path = Path("dylib_extracted.json")
+json_path.write_text(json.dumps(asdict(report), indent=2))
+print(f"[+] Extracted to {json_path}")
+EOF
+
+      - name: Upload artifacts
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dylib_extracted.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
